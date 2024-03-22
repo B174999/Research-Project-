@@ -1,0 +1,433 @@
+# ANNOTATION OF REPEATS
+
+# this script identifies the type of TEs across the entire genome
+# using RepeatMasker annotation
+
+# break up genome into bins
+# characterises type and density of repeats in each bin
+# estimate GC content in each bin
+
+
+######################################################################################
+
+
+#   INPUTTING OUR DATA
+
+# load required packages
+
+library(tidyverse)
+library(plyranges)
+library(ggplot2)
+library(Biostrings)
+library(dplyr)
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("BSgenome")
+library(lme4)
+library(lmerTest)
+library("scatterplot3d") 
+
+
+
+# load in our data and turn into data frame for manipulation
+
+eg_gff <- read_gff('data/icerya_purchasi.filteredRepeats.divergence.gff') %>%
+  mutate(type = as.character(type)) %>%
+  mutate(type = sub("-.*", "", type)) %>%
+  filter(!is.na(KIMURA80)) %>%
+  as_tibble() %>%
+  mutate(repeat_number = row_number()) %>%
+  as_granges()
+
+eg_gff_tbl <- as_tibble(eg_gff)
+  
+# correct for subfamily 'Penelope' which is miscategorised within LINE
+# rename and move to group PLE 
+eg_gff <- eg_gff_tbl %>%
+mutate(type = sub('LINE/Penelope','PLE/Penelope', type))
+
+# load in genome sequence of Icerya purchasi (for GC content estimation)
+genome_seq <- Biostrings::readDNAStringSet("data/genome/GCA_952773005.1_ihIcePurc2.1_genomic.fna")
+
+# rename sequence names and remove 'Icerya...'
+names(genome_seq) <- sub(' .*','', names(genome_seq))
+
+# fix up scaffold length for 3 scaffolds (one for each chromosome) 
+repeat_tbl <- tibble(seqnames = names(genome_seq), scaffold_length = width(genome_seq))
+
+# select columns we want to interpret
+eg_gff_tbl_selected <- eg_gff_tbl %>% select(seqnames, start, end, type, ID)
+
+# change names of columns to characters
+# remove mitochondria chromosome 'OX731682.1'
+eg_gff_tbl_mutate <- eg_gff_tbl_selected %>% mutate(
+  seqnames = as.character(seqnames),
+  type = as.character(type)
+) %>%
+  filter(seqnames != 'OX731682.1')
+
+
+############################################################################################
+
+# SPLITTING OUR GENOME DATA INTO BINS
+
+
+# put sequence into bins of length 1,000,000
+# assign 1,000,000 to variable 'bin_size' for simplicity in later functions
+bin_size = 1e6
+
+# following function makes a column with a list of all bin names
+
+# make empty table
+bins <- tibble()
+
+genome_index <- tibble(seqnames = names(genome_seq), contig_width = width(genome_seq))
+
+# loop through
+for(i in seq_along(genome_index$seqnames)){
+  #number each bin. Combine this number onto the end of bin name
+  new_tbl <- tibble(seqnames = genome_index$seqnames[i], bin_no = 1:ceiling(genome_index$contig_width[i]/bin_size)) %>%
+    mutate(bin_name = paste0(seqnames, "_", bin_no))
+  #combine this new column into our empty table
+  bins <- rbind(bins, new_tbl)
+}
+
+
+# this function removes mitochondria chromosome
+# and select for bin_name only
+bins <- bins %>%
+  filter(seqnames !="OX731682.1") %>%
+  dplyr::select(bin_name)
+
+
+# generate column for start and end of each bin
+eg_gff_bins <- eg_gff_tbl_mutate %>%
+  mutate(
+    bin_start = floor(start/bin_size)*bin_size + 1,
+    bin_end = ceiling(start/bin_size)*bin_size,
+  )
+
+
+#########################################################################################
+
+#   CORRECT FOR ANY OVERLAPPING REGIONS
+
+# check for sequences that don't overlap bins
+# repeat will be less or equal to bin end 
+
+eg_gff_not_overlapping <- eg_gff_bins %>% filter(end<=bin_end)
+
+# check fir sequences that do overlap bins
+# repeat end will be more than the bin end
+
+eg_gff_overlapping <- eg_gff_bins %>% filter(end>bin_end)
+
+# split overlapping regions into left and right side of the bin edge
+
+# left
+left_overlapping <- eg_gff_overlapping %>% 
+  mutate(end = bin_end)
+
+# right
+right_overlapping = eg_gff_overlapping %>%
+  mutate(start = bin_end +1)
+
+#combine left and right overlap back together
+
+eg_gff_tbl_binned <- rbind(eg_gff_not_overlapping, left_overlapping) %>%
+  rbind(right_overlapping)
+
+
+# creates dataframe that numbers each bin 
+
+eg_gff_tbl_binned_for_counting <- eg_gff_tbl_binned %>%
+  mutate(bin_no = bin_end/bin_size, 
+         bin_name = paste0(seqnames, "_", bin_no))
+
+# creates a dataframe which sort bins into ascending order of chromosome number and start codon number
+
+eg_gff_tbl_binned_arranged <- eg_gff_tbl_binned %>% 
+  arrange(seqnames, start)
+
+
+# remove '/' from the names of repeat types
+# group repeated data into the columns: seqnames, type and bin_start. 
+# generate new column of total length of each bin (bin_total)
+# output is three columns for bin_name, type and bin_total
+
+eg_gff_tbl_binned_grouped <- eg_gff_tbl_binned_arranged %>% 
+  mutate(type = sub("/.*", "", type)) %>%
+  group_by(seqnames, type, bin_start) %>% 
+  mutate(bin_total = sum(end - start +1)) %>%
+  ungroup() %>%
+  mutate(bin_name = paste0(seqnames, "_", bin_end/bin_size)) %>% #assign each bin to a name
+  select(bin_name, type, bin_total) %>%
+  base::unique() 
+
+# collect all data with scaffold length 
+# this code corrects our data by replacing NA output as numerical value of 0  
+# and fixes length of last bin to its true length (as truncated in original graphical output)
+eg_gff_tbl_binned_corrected <- eg_gff_tbl_binned_grouped %>%
+  pivot_wider(names_from = type, values_from = bin_total) %>% #selects for column name 'type' frequency against each bin (bin name). Assigns NA which we can input into original data
+  pivot_longer(!bin_name, names_to = "type", values_to = "bin_total") %>% #input data back into original data frame, so NA is now there 
+  mutate(bin_total = ifelse(is.na(bin_total), 0, bin_total)) %>% #ifelse function assigns NA as numerical value zero, if not NA keep numerical value already there 
+  mutate(seqnames = sub("_.*", "", bin_name),
+         bin_no = as.double(sub(".*_", "", bin_name)),
+         bin_end = bin_no*bin_size,
+         bin_start = bin_end-bin_size+1) %>%
+  inner_join(repeat_tbl) %>% #fixing length of last bin to true length
+  mutate(bin_end = ifelse(bin_end < scaffold_length, bin_end, scaffold_length),
+         bin_width = bin_end-bin_start+1) %>%
+  mutate(percentage = 100 * bin_total/bin_width) #percentage of that particular type of TE, for that bin 
+
+# function shows last 6 things at end and start of dataframe
+# as a check to confirm we have generated the correct set of data
+
+tail(eg_gff_tbl_binned_corrected)
+head(eg_gff_tbl_binned_corrected)
+
+
+
+
+#########################################################################################
+
+#  PLOTTING OUR DATA
+
+# (1) FOR ALL DATA
+# select and group repeated data (duplicated rows)
+eg_gff_tbl_binned_grouped <- eg_gff_tbl_binned_corrected %>% 
+  select(seqnames, type, bin_start, bin_total)
+
+for_plotting_transposons = base::unique(eg_gff_tbl_binned_grouped)
+
+for_plotting_transposons
+
+# plot data
+plot <- ggplot(for_plotting_transposons, mapping = aes(x = bin_start, y = bin_total, fill = type)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~seqnames, ncol = 1)
+
+# label x and y axis, change font size and theme
+plot <- plot + xlab('Bin Start') + ylab('Bin Length')
+
+plot <- plot + theme_classic() + theme(text = element_text(size=15))
+
+plot
+
+
+
+
+# (2) PLOT INDEPENDENTLY FOR MOST ABUNDANT REPEAT TYPES 
+
+# 1. DNA transposons; 2. LTRs; 3. LINEs
+
+# 2.1) FOR DNA TRANSPOSONS
+
+# filter for 'DNA' in type column from all our data 
+eg_gff_tbl_binned_DNA <- eg_gff_tbl_binned_arranged %>% 
+  filter(grepl('DNA', type)) %>%
+  mutate(type = sub('.*/','', type)) %>%
+  mutate(type = sub("-.*", '', type)) %>%
+  group_by(seqnames, type, bin_start) %>% 
+  mutate(bin_total = sum(end - start +1)) %>%
+  ungroup()
+
+# select and group repeated data (duplicated rows)
+eg_gff_tbl_grouped_DNA <- eg_gff_tbl_binned_DNA %>% 
+  select(seqnames, type, bin_start, bin_total)
+
+for_plotting_DNA = base::unique(eg_gff_tbl_grouped_DNA)
+
+for_plotting_DNA
+
+# plot data for DNA
+plot_DNA <- ggplot(for_plotting_DNA, mapping = aes(x = bin_start, y = bin_total, fill = type)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~seqnames, ncol = 1)
+
+# label x and y axis, change font size and theme
+plot_DNA <- plot_DNA + xlab('Bin Start') + ylab('Bin Length')
+
+plot_DNA <- plot_DNA + theme_classic() + theme(text = element_text(size=15))
+
+plot_DNA
+
+# 2.2) FOR LTR
+
+eg_gff_tbl_binned_LTR <- eg_gff_tbl_binned_arranged %>% 
+  filter(grepl('LTR', type)) %>%
+  mutate(type = sub('.*/','', type)) %>%
+  mutate(type = sub("-.*", '', type)) %>%
+  group_by(seqnames, type, bin_start) %>% 
+  mutate(bin_total = sum(end - start +1)) %>%
+  ungroup()
+
+# select and group repeated data (duplicated rows)
+eg_gff_tbl_grouped_LTR = eg_gff_tbl_binned_LTR %>% 
+  select(seqnames, type, bin_start, bin_total)
+
+for_plotting_LTR = base::unique(eg_gff_tbl_grouped_LTR)
+
+
+# plot data
+plot_LTR <- ggplot(for_plotting_LTR, mapping = aes(x = bin_start, y = bin_total, fill = type)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~seqnames, ncol = 1)
+
+# label x and y axis, change font size and theme
+plot_LTR <- plot_LTR + xlab('Bin Start') + ylab('Bin Length')
+
+plot_LTR <- plot_LTR + theme_classic() + theme(text = element_text(size=15))
+
+plot_LTR
+
+
+# 2.3) FOR LINE
+
+eg_gff_tbl_binned_line = eg_gff_tbl_binned_arranged %>% 
+  filter(grepl('LINE', type)) %>%
+  mutate(type = sub('.*/','', type)) %>%
+  mutate(type = sub("-.*", '', type)) %>%
+  group_by(seqnames, type, bin_start) %>% 
+  mutate(bin_total = sum(end - start +1)) %>%
+  ungroup()
+
+# select and group repeated data (duplicated rows)
+eg_gff_tbl_grouped_line = eg_gff_tbl_binned_line %>% 
+  select(seqnames, type, bin_start, bin_total)
+
+for_plotting_line = base::unique(eg_gff_tbl_grouped_line)
+
+# plot data
+plot_line <- ggplot(for_plotting_line, mapping = aes(x = bin_start, y = bin_total, fill = type)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~seqnames, ncol = 1)
+
+#label x and y axis, change font size and theme
+plot_line <- plot_line + xlab('Bin Start') + ylab('Bin Length')
+
+plot_line <- plot_line + theme_classic() + theme(text = element_text(size=15))
+
+plot_line
+
+
+
+
+##########################################################################################
+
+# ESTIMATING GC CONTENT
+
+# estimating GC content throughout the genome 
+
+# make granges to get entire genome sequence 
+# align genome sequence into bins 
+genome_binned_ranges <- eg_gff_tbl_binned_corrected %>%
+  dplyr::select(seqnames, bin_start, bin_end, bin_name) %>%
+  base::unique() %>%
+  dplyr::rename(start = bin_start, end = bin_end) %>%
+  as_granges()
+
+# calculation for GC content
+
+GC_content <- tibble(bin_name = character(), gc_count = integer(), at_count = integer(), n_count = integer())
+
+for(i in seq_along(genome_binned_ranges$bin_name)){
+  temp_ranges <- genome_binned_ranges[i]
+  temp_string <- as.character(BSgenome::getSeq(genome_seq, temp_ranges))
+  temp_counts <- table(strsplit(temp_string, split="")) %>%
+    as.data.frame() %>%
+    as_tibble() %>%
+    mutate(Var1 = as.character(Var1))
+  temp_counts_tbl <- tibble(bin_name = genome_binned_ranges$bin_name[i],
+                            gc_count = sum(temp_counts[temp_counts$Var1 %in% c('G', 'g', 'C', 'c'),]$Freq),
+                            at_count = sum(temp_counts[temp_counts$Var1 %in% c('A', 'a', 'T', 't'),]$Freq),
+                            n_count = sum(temp_counts[temp_counts$Var1 %in% c('N', 'n'),]$Freq)
+                            )
+  GC_content <- rbind(GC_content, temp_counts_tbl)
+}
+
+GC_content <- cbind(GC_content, (GC_content$gc_count)/(GC_content$at_count+GC_content$gc_count)*100)
+
+colnames(GC_content)[5] <- 'GC_content' 
+
+
+##########################################################################################
+
+# TYPE DENSITY 
+
+# Estimate distribution of density of each TE type along the genome
+# Type Density: estimated as the COUNT of each repeat type in each bin 
+# counts estimated for each repeat type: DNA, LINE, LTR, PLE, RC, SINE, Unknown
+
+
+
+# COUNTS OF REPEATS
+
+
+# to estimate count
+# this function converts factors into characters
+# output: table with the columns bin_name, type and count
+
+eg_gff_tbl_binned_for_counting <- eg_gff_tbl_binned_for_counting %>%
+  mutate(type = sub(pattern = '-.*', replacement = '', x = type))
+
+eg_gff_tbl_counted_wide <- base::table(eg_gff_tbl_binned_for_counting$bin_name, eg_gff_tbl_binned_for_counting$type) %>%
+  base::as.data.frame() %>%
+  as_tibble() %>%
+  mutate(Var1 = as.character(Var1),
+         Var2 = as.character(Var2)) %>%
+  pivot_wider(names_from = Var2, values_from = Freq) %>%
+  dplyr::rename(bin_name = Var1) 
+
+as_tibble(eg_gff_tbl_counted_wide)
+
+eg_gff_tbl_counted_long <- left_join(x = bins, y = eg_gff_tbl_counted_wide) %>%
+  pivot_longer(!bin_name, names_to = 'type', values_to = 'Count') 
+
+# double check there is no NA
+filter(.data = eg_gff_tbl_counted_long, is.na(Count))
+
+# remove subfamilies by removing '/' from type name
+# remove subfamilies so we can merge the same type together in one bin
+# so the columns are consistent in size 
+eg_gff_tbl_counted_filtered <- eg_gff_tbl_counted_long %>%
+  mutate(type = sub(pattern = '/.*', replacement = '', x = type)) %>%
+  group_by(bin_name, type) %>%
+  summarise(Total = sum(Count))
+
+# function filters each type and merges count of each subfamily into one variable
+# BINS
+BINS <- eg_gff_tbl_counted_filtered %>%
+  reframe(bin_name) %>%
+  unique()
+
+# (1) DNA
+DNA_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('DNA', type))
+
+# (2) LINE
+LINE_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('LINE', type))
+
+# (3) LTR
+LTR_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('LTR', type))
+
+# (4) PLE
+PLE_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('PLE', type))
+
+# (5) RC
+RC_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('RC', type))
+
+# (6) SINE
+SINE_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('SINE', type))
+
+# (7) Unknown
+Unknown_counted <- eg_gff_tbl_counted_filtered %>%
+  filter(grepl('Unknown', type))
+
+
+         
