@@ -1,6 +1,5 @@
-# ANNOTATION OF REPEATS
 
-# This script identifies type of repeats from RepeatMasker annotated genome. We will: (1) break up genome into bins, (2) characterises type and density of repeats in each bin, (3) estimate GC content in each bin
+# This script annotates the type of repeats from RepeatMasker annotated genome. We will: (1) break up genome into bins, (2) characterises type and density of repeats in each bin, (3) estimate GC content in each bin
 
 
 ######################################################################################
